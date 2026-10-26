@@ -21,6 +21,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"slices"
 	"time"
 
 	v1 "k8s.io/api/core/v1"
@@ -105,21 +106,15 @@ func reconcile(ctx context.Context, nodeUpdater *node.Updater) error {
 		return fmt.Errorf("failed to get node: %w", err)
 	}
 
-	// Start with existing addresses
-	addressMap := make(map[v1.NodeAddressType]string)
-	for _, addr := range currentNode.Status.Addresses {
-		addressMap[addr.Type] = addr.Address
-	}
-
 	// Detect Internal IP if configured
+	var detectedInternalIP string
 	if internalIPTarget != "" {
 		klog.V(3).Infof("Detecting internal IP using target %s", internalIPTarget)
-		internalIP, err := detector.DetectIP(internalIPTarget)
+		detectedInternalIP, err = detector.DetectIP(internalIPTarget)
 		if err != nil {
 			return fmt.Errorf("failed to detect internal IP: %w", err)
 		}
-		klog.V(2).Infof("Detected internal IP: %s", internalIP)
-		addressMap[v1.NodeInternalIP] = internalIP
+		klog.V(2).Infof("Detected internal IP: %s", detectedInternalIP)
 	}
 	// If internalIPTarget is not set, preserve existing InternalIP (e.g., set by kubelet)
 
@@ -131,22 +126,10 @@ func reconcile(ctx context.Context, nodeUpdater *node.Updater) error {
 	}
 	klog.V(2).Infof("Detected external IP: %s", detectedExternalIP)
 
-	// Check if external IP equals internal IP - if so, don't set external IP
-	if internalIP, hasInternal := addressMap[v1.NodeInternalIP]; hasInternal && internalIP == detectedExternalIP {
-		klog.V(2).Infof("External IP %s matches internal IP, removing external IP from addresses", detectedExternalIP)
-		delete(addressMap, v1.NodeExternalIP)
-	} else {
-		addressMap[v1.NodeExternalIP] = detectedExternalIP
-	}
-
-	// Convert map back to slice
-	addresses := make([]v1.NodeAddress, 0, len(addressMap))
-	for addrType, addrValue := range addressMap {
-		addresses = append(addresses, v1.NodeAddress{
-			Type:    addrType,
-			Address: addrValue,
-		})
-	}
+	// Build the desired address list, preserving all existing addresses
+	// (including duplicate InternalIP entries on dual-stack nodes) and only
+	// managing InternalIP (when internalIPTarget is set) and ExternalIP.
+	addresses := computeAddresses(currentNode.Status.Addresses, internalIPTarget, detectedInternalIP, detectedExternalIP)
 
 	// Check if addresses changed
 	if addressesEqual(currentNode.Status.Addresses, addresses) {
@@ -192,26 +175,74 @@ func createKubernetesClient(kubeconfigPath string) (kubernetes.Interface, error)
 	return client, nil
 }
 
-// addressesEqual checks if two address slices are equal
+// computeAddresses builds the desired node address list from the current
+// addresses plus the detected IPs. It preserves all existing address entries
+// (including duplicate InternalIP values present on dual-stack nodes and any
+// Hostname entry) and only manages InternalIP (when internalIPTarget is set)
+// and ExternalIP.
+//
+//   - When internalIPTarget != "", local-ccm owns InternalIP: all existing
+//     InternalIP entries are removed and replaced by a single entry holding
+//     detectedInternalIP. When internalIPTarget == "", the kubelet's
+//     InternalIP entries are preserved as-is.
+//   - When detectedExternalIP equals any InternalIP present in the result,
+//     any existing ExternalIP entry is removed and none is added. Otherwise
+//     exactly one ExternalIP entry with detectedExternalIP is ensured
+//     (existing ExternalIP entries are replaced).
+//   - All other address types (Hostname, etc.) are left untouched.
+func computeAddresses(current []v1.NodeAddress, internalIPTarget, detectedInternalIP, detectedExternalIP string) []v1.NodeAddress {
+	result := make([]v1.NodeAddress, 0, len(current)+1)
+
+	// Copy through everything except InternalIP/ExternalIP, which we manage.
+	for _, addr := range current {
+		if addr.Type == v1.NodeInternalIP || addr.Type == v1.NodeExternalIP {
+			continue
+		}
+		result = append(result, addr)
+	}
+
+	// InternalIP: when internalIPTarget is set we own it (single entry).
+	// Otherwise preserve all existing InternalIP entries (dual-stack safe).
+	var internalIPs []string
+	if internalIPTarget != "" {
+		internalIPs = []string{detectedInternalIP}
+		result = append(result, v1.NodeAddress{Type: v1.NodeInternalIP, Address: detectedInternalIP})
+	} else {
+		for _, addr := range current {
+			if addr.Type == v1.NodeInternalIP {
+				internalIPs = append(internalIPs, addr.Address)
+				result = append(result, addr)
+			}
+		}
+	}
+
+	// ExternalIP: only add when it doesn't duplicate an InternalIP. Any
+	// pre-existing ExternalIP was already dropped above, so a duplicate
+	// case leaves no ExternalIP in the result.
+	if !slices.Contains(internalIPs, detectedExternalIP) {
+		result = append(result, v1.NodeAddress{Type: v1.NodeExternalIP, Address: detectedExternalIP})
+	}
+
+	return result
+}
+
+// addressesEqual reports whether two address slices contain the same
+// addresses regardless of order. It performs a proper multiset comparison
+// so that duplicate NodeAddressType values (e.g. two InternalIP entries on a
+// dual-stack node) are compared correctly.
 func addressesEqual(a, b []v1.NodeAddress) bool {
 	if len(a) != len(b) {
 		return false
 	}
 
-	// Create maps for comparison
-	aMap := make(map[string]string)
-	bMap := make(map[string]string)
-
+	counts := make(map[[2]string]int, len(a))
 	for _, addr := range a {
-		aMap[string(addr.Type)] = addr.Address
+		counts[[2]string{string(addr.Type), addr.Address}]++
 	}
 	for _, addr := range b {
-		bMap[string(addr.Type)] = addr.Address
-	}
-
-	// Compare maps
-	for k, v := range aMap {
-		if bMap[k] != v {
+		key := [2]string{string(addr.Type), addr.Address}
+		counts[key]--
+		if counts[key] < 0 {
 			return false
 		}
 	}
